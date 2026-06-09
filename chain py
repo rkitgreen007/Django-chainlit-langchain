@@ -1,0 +1,102 @@
+# chat.py
+import os
+import django
+from dotenv import load_dotenv
+
+# =====================================================================
+# STEP 1: Bootstrap the Django environment prior to importing packages
+# =====================================================================
+load_dotenv()
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "myproject.settings")
+django.setup()
+
+import chainlit as cl
+from asgiref.sync import sync_to_async
+from myproject.models import Order  # Import your Django models here
+
+# LangChain Imports
+from langchain_openai import ChatOpenAI
+from langchain.agents import AgentExecutor, create_openai_tools_agent
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.tools import tool
+from langchain_core.runnables.config import RunnableConfig
+
+# =====================================================================
+# STEP 2: Define Agent Tools interacting with Django Database
+# =====================================================================
+
+@tool
+def fetch_order_status(order_id: str) -> str:
+    """Queries the database to fetch live fulfillment updates using a unique order identifier string."""
+    try:
+        # Wrap synchronous Django ORM query inside an active async context execution loop
+        order = Order.objects.get(order_id=order_id)
+        return f"Order {order_id} for {order.customer_name} is currently: '{order.status}'. Items included: {order.items}."
+    except Order.DoesNotExist:
+        return f"No records found for Order ID: {order_id}."
+
+# Add defined functions into the agent's executable tool surface area
+tools = [fetch_order_status]
+
+# =====================================================================
+# STEP 3: Chainlit Hooks managing Lifecycle & Agent Generation
+# =====================================================================
+
+@cl.on_chat_start
+async def start_chat_session():
+    """ Initializes a dedicated, memory-isolated LLM Agent when a new room starts. """
+    
+    # Initialize the primary LLM model
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, streaming=True)
+    
+    # Structure the target prompt system instruction set and memory placeholders
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", "You are an internal corporate operations assistant with access to the Django backend database database via provided helper tools."),
+        MessagesPlaceholder(variable_name="chat_history"),
+        ("human", "{input}"),
+        MessagesPlaceholder(variable_name="agent_scratchpad"),
+    ])
+    
+    # Create the functional underlying agent execution chain 
+    agent = create_openai_tools_agent(llm, tools, prompt)
+    agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
+    
+    # Initialize chat history memory list and attach instances explicitly onto user context memory map
+    cl.user_session.set("chat_history", [])
+    cl.user_session.set("agent_executor", agent_executor)
+    
+    await cl.Message(content="Hello! I am your AI Support Agent, directly connected to your Django database environment. Ask me to lookup order statuses.").send()
+
+
+@cl.on_message
+async def handle_user_input(message: cl.Message):
+    """ Intercepts a chat transmission, routes reasoning steps, and streams output. """
+    
+    # Read the instance parameters dynamically out of the thread user memory context maps
+    agent_executor = cl.user_session.get("agent_executor")
+    chat_history = cl.user_session.get("chat_history")
+    
+    # Setup an empty container message to host the textual stream updates
+    response_msg = cl.Message(content="")
+    await response_msg.send()
+    
+    # Initialize a LangChain-to-Chainlit callback handler framework automatically. 
+    # This automatically translates inner thoughts, reasoning, and tool calls into nested visual steps inside Chainlit UI!
+    chainlit_callback = cl.LangchainCallbackHandler(
+        stream_final_answer=True,
+        to_renderer=response_msg
+    )
+    
+    # Execute the agent computation graph natively over an async runtime pipeline layout
+    result = await agent_executor.ainvoke(
+        {"input": message.content, "chat_history": chat_history},
+        config=RunnableConfig(callbacks=[chainlit_callback])
+    )
+    
+    # Capture complete data updates and update local cross-turn memory structures
+    chat_history.append(("human", message.content))
+    chat_history.append(("ai", result["output"]))
+    cl.user_session.set("chat_history", chat_history)
+    
+    # Finalize visual updates to the interface
+    await response_msg.update()
